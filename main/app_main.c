@@ -118,6 +118,8 @@ static float flow_gpm = 0.0f;
 static int64_t last_valid_pulse_us = 0;
 static int64_t previous_valid_pulse_us = 0;
 
+static int64_t last_pulse_interval_us = 0;
+
 //---------------------------------------------------------
 //                  Thermistor State
 //---------------------------------------------------------
@@ -212,13 +214,16 @@ static void pulse_task(void *pvParameters)
         //two pulses are required to calculate flow rate because GPM depends on time between pulses
         if (previous_valid_pulse_us > 0) 
         {
-            int64_t pulse_interval_us =
-                last_valid_pulse_us - previous_valid_pulse_us;
+            int64_t pulse_interval_us = last_valid_pulse_us - previous_valid_pulse_us;
 
             if (pulse_interval_us > 0) 
             {   
-                // flow calculation:
-                // 1 pulse = 1 gallon
+
+                //save the interval for adaptive timeout
+                last_pulse_interval_us = pulse_interval_us;
+
+                //flow calculation:
+                //1 pulse = 1 gallon
                 //
                 //general flow formula:
                 //GPM = gallons per pulse × 60 seconds/minute / seconds between pulses
@@ -325,6 +330,8 @@ static void thermistor_init(void)
 // 3. publishes that message to the MQTT broker
 static void telemetry_task(void *pvParameters)
 {
+    TickType_t last_wake_time = xTaskGetTickCount();
+
     while (1) 
     {
         if (mqtt_connected && mqtt_client != NULL) 
@@ -333,6 +340,7 @@ static void telemetry_task(void *pvParameters)
             float flow_copy;
             float gallons_copy;
             int64_t last_pulse_copy;
+            int64_t interval_copy;
 
             //copy shared meter values while the mutex is locked.
             //this prevents the pulse task from chaning them halfway through the copy.
@@ -340,22 +348,45 @@ static void telemetry_task(void *pvParameters)
 
             pulses_copy = total_pulses;
             flow_copy = flow_gpm;
-            gallons_copy =
-                total_pulses * GALLONS_PER_PULSE;
+            gallons_copy = total_pulses * GALLONS_PER_PULSE;
             last_pulse_copy = last_valid_pulse_us;
+            interval_copy = last_pulse_interval_us;
 
             xSemaphoreGive(meter_mutex);
 
-            //if no pulse has been detected for 90 seconds assume the flow the has stopped
-            if (last_pulse_copy > 0) 
-            {
-                int64_t now_us = esp_timer_get_time();
+        //determine whether the latest flow measurement is still valid.
+        int64_t now_us = esp_timer_get_time();
 
-                if ((now_us - last_pulse_copy) > FLOW_TIMEOUT_US) 
-                {
-                    flow_copy = 0.0f;
-                }
+        if (last_pulse_copy == 0 || interval_copy == 0)
+        {
+            // Not enough pulses have been received
+            // to calculate an actual flow rate.
+            flow_copy = 0.0f;
+        }
+        else
+        {
+            // Start with the existing maximum timeout.
+            int64_t adaptive_timeout_us = FLOW_TIMEOUT_US;
+
+            // Use three times the previous pulse interval,
+            // provided it is below the maximum timeout.
+            if (interval_copy < FLOW_TIMEOUT_US / 3)
+            {
+                adaptive_timeout_us = interval_copy * 3;
             }
+
+            // Prevent extremely short timeouts.
+            if (adaptive_timeout_us < 3000000LL)
+            {
+                adaptive_timeout_us = 3000000LL;
+            }
+
+            // Check whether the previous measurement is stale.
+            if ((now_us - last_pulse_copy) > adaptive_timeout_us)
+            {
+                flow_copy = 0.0f;
+            }
+        }
 
             //temperature values are placeholders for now
             float supply_temp_f = 44.0f;
@@ -385,15 +416,16 @@ static void telemetry_task(void *pvParameters)
             {
                 //flash data LED whenever telemetry is sent
                 gpio_set_level(DATA_LED_GPIO, 1);
-                vTaskDelay(pdMS_TO_TICKS(1000));
+                vTaskDelay(pdMS_TO_TICKS(100));
                 gpio_set_level(DATA_LED_GPIO, 0);
             }
 
 
             ESP_LOGI(TAG, "Telemetry sent: %s | msg_id=%d", payload, msg_id);
         }
-        //wait 5 seconds before sending the next telemetry message
-        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
+        
+        //maintain a consistent telemetry period
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
     }
 }
 
