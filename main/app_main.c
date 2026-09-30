@@ -56,6 +56,11 @@
 //---------------------------------------------------------
 //                    Configuration
 //---------------------------------------------------------
+//ChillSense device identification
+#define BUILDING_ID "building1"
+#define UNIT_ID "101"
+#define DEVICE_ID "chillsense_unit101"
+
 #define FLOW_GPIO GPIO_NUM_4
 
 //thermistor
@@ -392,25 +397,53 @@ static void telemetry_task(void *pvParameters)
             float supply_temp_f = 44.0f;
             float return_temp_f = 55.0f;
 
-            char payload[256];
+            char payload[320];
 
             //format the sensor data as JSON
             snprintf(payload, sizeof(payload),
 
                 "{"
-                "\"device_id\":\"chillsense_test_01\","
-                "\"flow_gpm\":%.2f,"
-                "\"total_gallons\":%.2f,"
-                "\"pulse_count\":%" PRIu32 ","
-                "\"supply_temp_f\":%.1f,"
-                "\"return_temp_f\":%.1f"
+                    "\"device_id\":\"%s\","
+                    "\"building_id\":\"%s\","
+                    "\"unit_id\":\"%s\","
+                    "\"flow_gpm\":%.2f,"
+                    "\"total_gallons\":%.2f,"
+                    "\"pulse_count\":%" PRIu32 ","
+                    "\"supply_temp_f\":%.1f,"
+                    "\"return_temp_f\":%.1f"
                 "}",
 
-                flow_copy, gallons_copy, pulses_copy, supply_temp_f, return_temp_f);
+                DEVICE_ID,
+                BUILDING_ID,
+                UNIT_ID,
+                flow_copy,
+                gallons_copy,
+                pulses_copy,
+                supply_temp_f,
+                return_temp_f);
+
+            //build the MQTT topic using the building and unit identifiers
+            char mqtt_topic[128];
+
+            snprintf(
+                mqtt_topic,
+                sizeof(mqtt_topic),
+                "chillsense/%s/%s/telemetry",
+                BUILDING_ID,
+                UNIT_ID
+            );
 
             //publish the JSON message to the MQTT broker
-            //Qos 1 means deliver this message at least once
-            int msg_id = esp_mqtt_client_publish(mqtt_client, "chillsense/test/telemetry", payload, 0, 1, 0);
+            //QoS 1 means deliver this message at least once
+            int msg_id = esp_mqtt_client_publish(
+                mqtt_client,
+                mqtt_topic,
+                payload,
+                0,
+                1,
+                0
+            );
+
             
             if (msg_id >= 0)
             {
@@ -423,7 +456,7 @@ static void telemetry_task(void *pvParameters)
 
             ESP_LOGI(TAG, "Telemetry sent: %s | msg_id=%d", payload, msg_id);
         }
-        
+
         //maintain a consistent telemetry period
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
     }
@@ -537,24 +570,38 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 // ESP32 -> MQTT broker -> MQTTX / cloud application
 static void mqtt_app_start(void)
 {
-    const esp_mqtt_client_config_t mqtt_cfg = {
-    .broker = { 
-        //broker address is configured through menuconfig ">ESP-IDF: SDK Configuration Editor (Menuconfig)"
-        .address.uri = CONFIG_EXAMPLE_MQTT_BROKER_URI,
-#if CONFIG_EXAMPLE_BROKER_CERTIFICATE_OVERRIDDEN
-            .verification.certificate = cert_override_pem,
+    const esp_mqtt_client_config_t mqtt_cfg = 
+    {
 
-#elif CONFIG_EXAMPLE_CERT_VALIDATE_MOSQUITTO_CA
-            .verification.certificate = (const char *)mosquitto_org_crt_start,
-#else
-            //use ESP-IDF's built in trusted CA bundle to validate the broker's transport layer security (TLS) certificate.
-            .verification.crt_bundle_attach = esp_crt_bundle_attach,
-#endif
+    .broker = 
+    {
+        .address.uri = "mqtts://q1b59520.ala.us-east-1.emqxsl.com:8883",
+
+        //use ESP-IDF's built-in CA bundle
+        //to verify the EMQX TLS certificate
+        .verification = 
+        {
+        .crt_bundle_attach = esp_crt_bundle_attach,
         },
-            //send MQTT keepalive ping every 30 seconds to maintain the connection
-            .session = {.keepalive = 30,}, 
-            //if the connections drops retry after 5 seconds
-            .network = {.reconnect_timeout_ms = 5000,},
+    },
+
+    .credentials = {
+        .username = "chillsense_device",
+
+        .authentication = {
+            .password = "chillsense123",
+        },
+    },
+
+    //send MQTT keepalive ping every 30 seconds
+    .session = {
+        .keepalive = 30,
+    },
+
+    //if connection drops, retry after 5 seconds
+    .network = {
+        .reconnect_timeout_ms = 5000,
+    },
     };
 
     ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes",esp_get_free_heap_size());
