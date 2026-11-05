@@ -26,6 +26,9 @@
  */
 
 #include <inttypes.h>
+#include <stdatomic.h>
+#include "flow_meter.h"
+#include "telemetry.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -52,14 +55,15 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 //---------------------------------------------------------
 //                    Configuration
 //---------------------------------------------------------
 //ChillSense device identification
-#define BUILDING_ID "building1"
-#define UNIT_ID "101"
-#define DEVICE_ID "chillsense_unit101"
+#define BUILDING_ID CONFIG_CHILLSENSE_BUILDING_ID
+#define UNIT_ID CONFIG_CHILLSENSE_UNIT_ID
+#define DEVICE_ID CONFIG_CHILLSENSE_DEVICE_ID
 
 #define FLOW_GPIO GPIO_NUM_4
 
@@ -88,16 +92,8 @@
 //data LED
 #define DATA_LED_GPIO GPIO_NUM_15
 
-//meter is 1 gallon per pulse (tempoary value since the meter is mcuh faster than 1 gallon per pulse)
+// Provisional calibration: confirm gallons per pulse with the actual meter before use.
 #define GALLONS_PER_PULSE 1.0f
-
-//ignore additional switch closures that happen too soon afterthe previous pulse
-//100 ms is fine for this slow mechanical/dry-contact meter
-#define DEBOUNCE_TIME_US 100000LL
-
-//if no pulse occurs for this long, report flow as zero
-//meter nominal minimum is around 1 GPM, which is one pulse every 60 seconds with a 1 gallon per pulse output
-#define FLOW_TIMEOUT_US 90000000LL
 
 #define TELEMETRY_PERIOD_MS 5000
 
@@ -108,22 +104,16 @@ static const char *TAG = "chillsense";
 //                      MQTT state
 //--------------------------------------------------------- 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
-static bool mqtt_connected = false;
+static atomic_bool mqtt_connected = false;
 
 
 //---------------------------------------------------------
 //                  Flowmeter State
 //--------------------------------------------------------- 
-static TaskHandle_t pulse_task_handle = NULL;
+static QueueHandle_t pulse_queue = NULL;
 static SemaphoreHandle_t meter_mutex = NULL;
-
-static uint32_t total_pulses = 0;
-static float flow_gpm = 0.0f;
-
-static int64_t last_valid_pulse_us = 0;
-static int64_t previous_valid_pulse_us = 0;
-
-static int64_t last_pulse_interval_us = 0;
+static flow_meter_t meter = {0};
+static atomic_uint pulse_queue_drops = 0;
 
 //---------------------------------------------------------
 //                  Thermistor State
@@ -160,15 +150,16 @@ extern const uint8_t mosquitto_org_crt_end[]
 //So HIGH -> LOW means one meter pulse occurred
 //
 //The ISR does NOT process the pulse directly
-//It only wakes the pulse processing task below
+//It queues the edge timestamp for the pulse processing task below.
 static void flow_gpio_isr_handler(void *arg)
 {
     BaseType_t higher_priority_task_woken = pdFALSE;
 
-    if (pulse_task_handle != NULL) 
+    // Preserve edge time and every queued edge; task scheduling must not alter GPM.
+    int64_t pulse_us = esp_timer_get_time();
+    if (xQueueSendFromISR(pulse_queue, &pulse_us, &higher_priority_task_woken) != pdTRUE)
     {
-        //notify the normal FreeRTOS task that a pulse occurred
-        vTaskNotifyGiveFromISR(pulse_task_handle, &higher_priority_task_woken);
+        atomic_fetch_add(&pulse_queue_drops, 1);
     }
 
     if (higher_priority_task_woken == pdTRUE) 
@@ -181,7 +172,7 @@ static void flow_gpio_isr_handler(void *arg)
 //---------------------------------------------------------
 //              Flow pulse processing task
 //--------------------------------------------------------- 
-//This task sleeps until the GPIO interrupt reports a pulse
+//This task sleeps until the GPIO interrupt queues a pulse timestamp.
 //Once awake:
 //1. rejects switch bounce
 //2. counts the pulse
@@ -189,60 +180,23 @@ static void flow_gpio_isr_handler(void *arg)
 //4. calculates GPM from the time between pulses
 static void pulse_task(void *pvParameters)
 {
-    int64_t last_interrupt_us = 0;
-
-    while (1) 
+    while (1)
     {
-        //wait here until the GPIO interrupt wakes
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        int64_t pulse_us;
+        xQueueReceive(pulse_queue, &pulse_us, portMAX_DELAY);
 
-        //ESP timer returns elapsed time in microseconds
-        int64_t now_us = esp_timer_get_time();
-
-        //ignore duplicate electrical transitions that occur within 100 ms of the previous accepted pulse
-        if ((now_us - last_interrupt_us) < DEBOUNCE_TIME_US) 
-        {
-            continue;
-        }
-
-        last_interrupt_us = now_us;
-
-        //lock shared flow meter variables so the MQTT task cannot read them while they are being modified
         xSemaphoreTake(meter_mutex, portMAX_DELAY);
-
-        total_pulses++;
-
-        previous_valid_pulse_us = last_valid_pulse_us;
-        last_valid_pulse_us = now_us;
-
-        //one pulse alone only tells us volume
-        //two pulses are required to calculate flow rate because GPM depends on time between pulses
-        if (previous_valid_pulse_us > 0) 
-        {
-            int64_t pulse_interval_us = last_valid_pulse_us - previous_valid_pulse_us;
-
-            if (pulse_interval_us > 0) 
-            {   
-
-                //save the interval for adaptive timeout
-                last_pulse_interval_us = pulse_interval_us;
-
-                //flow calculation:
-                //1 pulse = 1 gallon
-                //
-                //general flow formula:
-                //GPM = gallons per pulse × 60 seconds/minute / seconds between pulses
-                //
-                //since our timing is in microseconds, multiply by 60,000,000 instead.
-                flow_gpm = (GALLONS_PER_PULSE * 60000000.0f) / (float)pulse_interval_us;
-            }
-        }
-
-        float total_gallons = total_pulses * GALLONS_PER_PULSE;
-
-        ESP_LOGI(TAG, "Flow pulse detected: pulses=%" PRIu32 ", total=%.2f gal, flow=%.2f GPM", total_pulses, total_gallons, flow_gpm);
-        //release the shared data for the MQTT task
+        bool accepted = flow_accept_pulse(&meter, pulse_us, GALLONS_PER_PULSE);
+        flow_meter_t snapshot = meter;
         xSemaphoreGive(meter_mutex);
+
+        if (accepted)
+        {
+            ESP_LOGI(TAG, "Flow pulse detected: pulses=%" PRIu32
+                     ", total=%.2f gal, flow=%.2f GPM",
+                     snapshot.total_pulses, snapshot.total_pulses * GALLONS_PER_PULSE,
+                     snapshot.flow_gpm);
+        }
     }
 }
 
@@ -339,99 +293,28 @@ static void telemetry_task(void *pvParameters)
 
     while (1) 
     {
-        if (mqtt_connected && mqtt_client != NULL) 
+        if (atomic_load(&mqtt_connected) && mqtt_client != NULL)
         {
-            uint32_t pulses_copy;
-            float flow_copy;
-            float gallons_copy;
-            int64_t last_pulse_copy;
-            int64_t interval_copy;
-
-            //copy shared meter values while the mutex is locked.
-            //this prevents the pulse task from chaning them halfway through the copy.
             xSemaphoreTake(meter_mutex, portMAX_DELAY);
-
-            pulses_copy = total_pulses;
-            flow_copy = flow_gpm;
-            gallons_copy = total_pulses * GALLONS_PER_PULSE;
-            last_pulse_copy = last_valid_pulse_us;
-            interval_copy = last_pulse_interval_us;
-
+            flow_meter_t snapshot = meter;
+            int64_t now_us = esp_timer_get_time();
             xSemaphoreGive(meter_mutex);
 
-        //determine whether the latest flow measurement is still valid.
-        int64_t now_us = esp_timer_get_time();
-
-        if (last_pulse_copy == 0 || interval_copy == 0)
-        {
-            // Not enough pulses have been received
-            // to calculate an actual flow rate.
-            flow_copy = 0.0f;
-        }
-        else
-        {
-            // Start with the existing maximum timeout.
-            int64_t adaptive_timeout_us = FLOW_TIMEOUT_US;
-
-            // Use three times the previous pulse interval,
-            // provided it is below the maximum timeout.
-            if (interval_copy < FLOW_TIMEOUT_US / 3)
-            {
-                adaptive_timeout_us = interval_copy * 3;
-            }
-
-            // Prevent extremely short timeouts.
-            if (adaptive_timeout_us < 3000000LL)
-            {
-                adaptive_timeout_us = 3000000LL;
-            }
-
-            // Check whether the previous measurement is stale.
-            if ((now_us - last_pulse_copy) > adaptive_timeout_us)
-            {
-                flow_copy = 0.0f;
-            }
-        }
-
-            //temperature values are placeholders for now
-            float supply_temp_f = 44.0f;
-            float return_temp_f = 55.0f;
-
-            char payload[320];
-
-            //format the sensor data as JSON
-            snprintf(payload, sizeof(payload),
-
-                "{"
-                    "\"device_id\":\"%s\","
-                    "\"building_id\":\"%s\","
-                    "\"unit_id\":\"%s\","
-                    "\"flow_gpm\":%.2f,"
-                    "\"total_gallons\":%.2f,"
-                    "\"pulse_count\":%" PRIu32 ","
-                    "\"supply_temp_f\":%.1f,"
-                    "\"return_temp_f\":%.1f"
-                "}",
-
-                DEVICE_ID,
-                BUILDING_ID,
-                UNIT_ID,
-                flow_copy,
-                gallons_copy,
-                pulses_copy,
-                supply_temp_f,
-                return_temp_f);
-
-            //build the MQTT topic using the building and unit identifiers
+            char payload[512];
+            int payload_len = telemetry_payload(payload, sizeof(payload), DEVICE_ID,
+                                                BUILDING_ID, UNIT_ID, &snapshot,
+                                                GALLONS_PER_PULSE, now_us,
+                                                atomic_load(&pulse_queue_drops));
             char mqtt_topic[128];
-
-            snprintf(
-                mqtt_topic,
-                sizeof(mqtt_topic),
-                "chillsense/%s/%s/telemetry",
-                BUILDING_ID,
-                UNIT_ID
-            );
+            int topic_len = telemetry_topic(mqtt_topic, sizeof(mqtt_topic),
+                                            BUILDING_ID, UNIT_ID);
+            if (payload_len < 0 || (size_t)payload_len >= sizeof(payload) ||
+                topic_len < 0 || (size_t)topic_len >= sizeof(mqtt_topic))
+            {
+                ESP_LOGE(TAG, "Telemetry exceeds buffer; publish skipped");
+                vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
+                continue;
+            }
 
             //publish the JSON message to the MQTT broker
             //QoS 1 means deliver this message at least once
@@ -447,14 +330,22 @@ static void telemetry_task(void *pvParameters)
             
             if (msg_id >= 0)
             {
-                //flash data LED whenever telemetry is sent
+                // Flash for local queue acceptance; broker delivery is logged on PUBACK.
                 gpio_set_level(DATA_LED_GPIO, 1);
                 vTaskDelay(pdMS_TO_TICKS(100));
                 gpio_set_level(DATA_LED_GPIO, 0);
             }
 
 
-            ESP_LOGI(TAG, "Telemetry sent: %s | msg_id=%d", payload, msg_id);
+            if (msg_id >= 0)
+            {
+                ESP_LOGI(TAG, "Telemetry queued: topic=%s payload=%s | msg_id=%d",
+                         mqtt_topic, payload, msg_id);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Telemetry enqueue failed: msg_id=%d", msg_id);
+            }
         }
 
         //maintain a consistent telemetry period
@@ -493,7 +384,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
         
         //allows the telemetry task to begin publishing data.
-        mqtt_connected = true;
+        atomic_store(&mqtt_connected, true);
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -502,7 +393,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
 
         //prevent telemetry from attempting to publish until the MQTT client reconnects
-        mqtt_connected = false;
+        atomic_store(&mqtt_connected, false);
         break;
 
     case MQTT_EVENT_PUBLISHED:
@@ -570,51 +461,40 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 // ESP32 -> MQTT broker -> MQTTX / cloud application
 static void mqtt_app_start(void)
 {
-    const esp_mqtt_client_config_t mqtt_cfg = 
-    {
-
-    .broker = 
-    {
-        .address.uri = "mqtts://q1b59520.ala.us-east-1.emqxsl.com:8883",
-
-        //use ESP-IDF's built-in CA bundle
-        //to verify the EMQX TLS certificate
-        .verification = 
-        {
-        .crt_bundle_attach = esp_crt_bundle_attach,
+    const esp_mqtt_client_config_t mqtt_cfg = {
+        .broker = {
+            .address.uri = CONFIG_EXAMPLE_MQTT_BROKER_URI,
+#if CONFIG_EXAMPLE_BROKER_CERTIFICATE_OVERRIDDEN
+            .verification.certificate = cert_override_pem,
+#elif CONFIG_EXAMPLE_CERT_VALIDATE_MOSQUITTO_CA
+            .verification.certificate = (const char *)mosquitto_org_crt_start,
+#else
+            .verification.crt_bundle_attach = esp_crt_bundle_attach,
+#endif
         },
-    },
-
-    .credentials = {
-        .username = "chillsense_device",
-
-        .authentication = {
-            .password = "chillsense123",
+        .credentials = {
+            .username = CONFIG_CHILLSENSE_MQTT_USERNAME[0]
+                            ? CONFIG_CHILLSENSE_MQTT_USERNAME : NULL,
+            .authentication.password = CONFIG_CHILLSENSE_MQTT_PASSWORD[0]
+                            ? CONFIG_CHILLSENSE_MQTT_PASSWORD : NULL,
         },
-    },
-
-    //send MQTT keepalive ping every 30 seconds
-    .session = {
-        .keepalive = 30,
-    },
-
-    //if connection drops, retry after 5 seconds
-    .network = {
-        .reconnect_timeout_ms = 5000,
-    },
+        .session.keepalive = 30,
+        .network.reconnect_timeout_ms = 5000,
     };
 
     ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes",esp_get_free_heap_size());
 
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
 
-    //register our event handler function so esp-idf can tell when MQTT connects, disconnects, publishes, or errors.
-    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler,NULL);
+    ESP_ERROR_CHECK(mqtt_client ? ESP_OK : ESP_ERR_NO_MEM);
 
-    esp_mqtt_client_start(mqtt_client);
+    //register our event handler function so esp-idf can tell when MQTT connects, disconnects, publishes, or errors.
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
+
+    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
 
     //start the seperate task that publishes telemetry every 5 seconds
-    xTaskCreate(telemetry_task, "telemetry_task", 4096, NULL, 5, NULL);
+    ESP_ERROR_CHECK(xTaskCreate(telemetry_task, "telemetry_task", 4096, NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
 
 //---------------------------------------------------------
@@ -691,21 +571,6 @@ static void thermistor_task(void *pvParameters)
     }
 }
 
-static void data_led_test_task(void *pvParameters)
-{
-    while (1)
-    {
-        ESP_LOGI(TAG, "Yellow LED ON");
-        gpio_set_level(DATA_LED_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
-        ESP_LOGI(TAG, "Yellow LED OFF");
-        gpio_set_level(DATA_LED_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-}
-
-
 //---------------------------------------------------------
 //                          Main
 //---------------------------------------------------------
@@ -724,6 +589,13 @@ void app_main(void)
 
     ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
 
+    if (!valid_identity(BUILDING_ID) || !valid_identity(UNIT_ID) ||
+        !valid_identity(DEVICE_ID))
+    {
+        ESP_LOGE(TAG, "Invalid identity: use 1-32 letters, digits, underscores or hyphens");
+        return;
+    }
+
     //mutex protects shared flow-meter data from being accessed by two tasks at exactly the same time.
     meter_mutex = xSemaphoreCreateMutex();
 
@@ -733,8 +605,11 @@ void app_main(void)
         return;
     }
 
-    //strta the pulse processing task before enabling GPIO interupts so that the task is ready to handle pulses immediately
-    xTaskCreate(pulse_task, "pulse_task", 3072, NULL, 10, &pulse_task_handle);
+    pulse_queue = xQueueCreate(32, sizeof(int64_t));
+    ESP_ERROR_CHECK(pulse_queue ? ESP_OK : ESP_ERR_NO_MEM);
+    // Start the consumer before enabling GPIO interrupts.
+    ESP_ERROR_CHECK(xTaskCreate(pulse_task, "pulse_task", 3072, NULL, 10, NULL) == pdPASS
+                        ? ESP_OK : ESP_ERR_NO_MEM);
 
     //configure GPIO15 for data/activity LED
     status_led_init();
@@ -747,14 +622,14 @@ void app_main(void)
     thermistor_init();
 
     //start continuous thermistor health monitoring
-    xTaskCreate(
+    ESP_ERROR_CHECK(xTaskCreate(
         thermistor_task,
         "thermistor_task",
         3072,
         NULL,
         5,
         NULL
-    );
+    ) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     //initialize esp-idf networking services
     ESP_ERROR_CHECK(nvs_flash_init());

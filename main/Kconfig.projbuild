@@ -1,5 +1,25 @@
 menu "Example Configuration"
 
+    config CHILLSENSE_BUILDING_ID
+        string "Building ID (letters, digits, underscore or hyphen; max 32)"
+        default "building1"
+
+    config CHILLSENSE_UNIT_ID
+        string "Unit ID (letters, digits, underscore or hyphen; max 32)"
+        default "101"
+
+    config CHILLSENSE_DEVICE_ID
+        string "Device ID (letters, digits, underscore or hyphen; max 32)"
+        default "chillsense_unit101"
+
+    config CHILLSENSE_MQTT_USERNAME
+        string "MQTT username (empty for anonymous test broker)"
+        default ""
+
+    config CHILLSENSE_MQTT_PASSWORD
+        string "MQTT password (stored in ignored local sdkconfig)"
+        default ""
+
     choice EXAMPLE_CERT_VALIDATION
         prompt "Certificate validation method"
         default EXAMPLE_CERT_VALIDATE_BUNDLE
@@ -18,8 +38,8 @@ menu "Example Configuration"
 
     config EXAMPLE_MQTT_BROKER_URI
         string "MQTT broker URI"
-        default "mqtts://broker.emqx.io:8883"
         default "mqtts://test.mosquitto.org:8883" if EXAMPLE_CERT_VALIDATE_MOSQUITTO_CA
+        default "mqtts://broker.emqx.io:8883"
         help
             URI to the MQTT broker.
             When using the example broker the port must be set to 8883 if testing
@@ -39,3 +59,4 @@ menu "Example Configuration"
         default y if EXAMPLE_BROKER_CERTIFICATE_OVERRIDE != ""
 
 endmenu
+

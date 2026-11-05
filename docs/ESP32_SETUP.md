@@ -71,6 +71,10 @@ mqtts://broker.emqx.io:8883
 
 This is only a development/test broker. For deployment, replace it with the project's private/cloud broker and use appropriate credentials/security.
 
+Set **MQTT username**, **MQTT password**, and the building/unit/device IDs under the same menu. Firmware uses these settings; no broker credentials are hard-coded. IDs must contain 1-32 letters, digits, underscores, or hyphens. Invalid IDs stop startup with an error.
+
+Use the certificate bundle for the cloud broker, or explicitly select an appropriate embedded/override CA and matching broker URI. Keep the generated sdkconfig and build output private: they contain local credentials. Replace credentials previously exposed in repository history before using the private broker.
+
 ## 7. Build
 
 Run:
@@ -114,3 +118,4 @@ Run from PowerShell at the repository root:
 ```powershell
 .\scripts\check_environment.ps1
 ```
+

@@ -6,7 +6,7 @@ The Dwyer WMT2-A-C-02-1 provides a **dry-contact closure** pulse output.
 
 The meter does not generate a powered logic voltage. Electrically, the two pulse wires behave like the two terminals of a switch. The ESP32 supplies the logic pull-up voltage.
 
-For this model:
+The current firmware provisionally assumes:
 
 ```text
 1 pulse = 1 gallon
@@ -67,4 +67,7 @@ Examples:
 - 12 seconds -> 5 GPM
 - 60 seconds -> 1 GPM
 
-The current firmware reports zero flow after an extended no-pulse timeout.
+Validate this scale with the actual meter's documentation and a measured-volume test. The source previously noted that the observed meter pulsed faster than this assumption. Do not treat the scale or the 100 ms debounce as calibrated.
+
+The no-pulse timeout is clamp(3 × previous interval, 3 seconds, 90 seconds). At the timeout, telemetry reports zero; the next accepted pulse counts volume but starts a new session at zero GPM. The following pulse establishes the new rate. See [VALIDATION.md](VALIDATION.md).
+
